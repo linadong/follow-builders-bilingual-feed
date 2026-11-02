@@ -16,10 +16,18 @@
 // Output: JSON to stdout
 // ============================================================================
 
+// LOCAL PATCH: Node's global fetch ignores HTTP_PROXY/HTTPS_PROXY by default.
+// In environments that route egress through a proxy, fetches hang until the
+// socket times out. Enabling the env-proxy agent makes it honour *_PROXY vars.
+if (!process.env.NODE_USE_ENV_PROXY) process.env.NODE_USE_ENV_PROXY = '1';
+
 import { readFile, mkdir } from 'fs/promises';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
+
+import { loadPrompts } from './lib/prompts.js';
+import { fetchText as netFetchText } from './lib/net.js';
 
 // -- Constants ---------------------------------------------------------------
 
@@ -30,27 +38,32 @@ const FEED_X_URL = 'https://raw.githubusercontent.com/zarazhangrui/follow-builde
 const FEED_PODCASTS_URL = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-podcasts.json';
 const FEED_BLOGS_URL = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/feed-blogs.json';
 
-const PROMPTS_BASE = 'https://raw.githubusercontent.com/zarazhangrui/follow-builders/main/prompts';
-const PROMPT_FILES = [
-  'summarize-podcast.md',
-  'summarize-tweets.md',
-  'summarize-blogs.md',
-  'digest-intro.md',
-  'translate.md'
-];
+// SECURITY (local hardening): upstream fetched prompt .md files from GitHub at
+// runtime and had the agent execute them as instructions — a remote prompt
+// injection vector. This install pins prompts to disk. Remote fetch is disabled.
+const USE_REMOTE_PROMPTS = false;
 
 // -- Fetch helpers -----------------------------------------------------------
 
+// LOCAL PATCH: hard timeout so a bad network never hangs the digest run.
+const FETCH_TIMEOUT_MS = 30000;
+
+// Transport goes through lib/net.js: curl first, undici fallback. Plain fetch
+// stalls on some hosts in this environment (see net.js for the reason).
 async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return res.json();
+  try {
+    return JSON.parse(await netFetchText(url, { ttl: 1800, retries: 1 }));
+  } catch {
+    return null;
+  }
 }
 
 async function fetchText(url) {
-  const res = await fetch(url);
-  if (!res.ok) return null;
-  return res.text();
+  try {
+    return await netFetchText(url, { ttl: 1800, retries: 1 });
+  } catch {
+    return null;
+  }
 }
 
 // -- Main --------------------------------------------------------------------
@@ -72,7 +85,17 @@ async function main() {
     }
   }
 
-  // 2. Fetch all three feeds
+  // 2. Local source mode (see prepare-local.js) — bypasses the upstream feed.
+  //    Checked BEFORE any network call so a flaky upstream can't break a local run.
+  const mode = process.env.FB_SOURCES_MODE || config.sources?.mode || 'upstream';
+  if (mode !== 'upstream') {
+    const { buildLocalDigest } = await import('./prepare-local.js');
+    const local = await buildLocalDigest(config, { mode });
+    console.log(JSON.stringify(local, null, 2));
+    return;
+  }
+
+  // 2b. Fetch all three feeds (curl transport — see lib/net.js)
   const [feedX, feedPodcasts, feedBlogs] = await Promise.all([
     fetchJSON(FEED_X_URL),
     fetchJSON(FEED_PODCASTS_URL),
@@ -98,42 +121,16 @@ async function main() {
     );
   }
 
-  // 3. Load prompts with priority: user custom > remote (GitHub) > local default
+  // 3. Load prompts with priority: user custom > local default
   //
   // If the user has a custom prompt at ~/.follow-builders/prompts/<file>,
-  // use that (they personalized it — don't overwrite with remote updates).
-  // Otherwise, fetch the latest from GitHub so they get central improvements.
-  // If GitHub is unreachable, fall back to the local copy shipped with the skill.
-  const prompts = {};
+  // use that (they personalized it).
+  // Otherwise use the local copy shipped with the skill.
+  //
+  // NOTE: remote (GitHub) prompt fetching is intentionally disabled in this
+  // install — see USE_REMOTE_PROMPTS above.
   const scriptDir = decodeURIComponent(new URL('.', import.meta.url).pathname);
-  const localPromptsDir = join(scriptDir, '..', 'prompts');
-  const userPromptsDir = join(USER_DIR, 'prompts');
-
-  for (const filename of PROMPT_FILES) {
-    const key = filename.replace('.md', '').replace(/-/g, '_');
-    const userPath = join(userPromptsDir, filename);
-    const localPath = join(localPromptsDir, filename);
-
-    // Priority 1: user's custom prompt (they personalized it)
-    if (existsSync(userPath)) {
-      prompts[key] = await readFile(userPath, 'utf-8');
-      continue;
-    }
-
-    // Priority 2: latest from GitHub (central updates)
-    const remote = await fetchText(`${PROMPTS_BASE}/${filename}`);
-    if (remote) {
-      prompts[key] = remote;
-      continue;
-    }
-
-    // Priority 3: local copy shipped with the skill
-    if (existsSync(localPath)) {
-      prompts[key] = await readFile(localPath, 'utf-8');
-    } else {
-      errors.push(`Could not load prompt: ${filename}`);
-    }
-  }
+  const prompts = await loadPrompts(errors, join(scriptDir, '..', 'prompts'));
 
   // 4. Build the output — everything the LLM needs in one blob
   const output = {
